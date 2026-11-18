@@ -16,6 +16,11 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional runtime dependency for AI features
+    OpenAI = None
 # flask_jwt_extended= It is a Python package that helps us implement JWT(Json Web Token) authentication in Flask applications.
 # ============================================================
 # CONFIGURATION & LOGGING SETUP
@@ -140,7 +145,7 @@ class MySQLDatabaseManager: #db=MySQLDatabaseManager then db is an object only b
                 )
             """)
             
-            conn.commit()
+            conn.commit() # confirms the transaction and saves the changes .
             cursor.close()
             conn.close()
         except Error as e:
@@ -270,6 +275,41 @@ class MongoAuditManager:
 # Instantiate Managers
 db_mysql = MySQLDatabaseManager()
 db_mongo = MongoAuditManager()
+
+
+def get_ai_inventory_answer(question, inventory_items=None):
+    """Ask OpenAI a question using the current inventory snapshot."""
+    if not question or not str(question).strip():
+        raise InvalidDataError("A question is required for AI assistance.")
+
+    if OpenAI is None:
+        raise RuntimeError(
+            "The openai package is not installed. Install it with: pip install openai"
+        )
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is missing. Set it in your environment before using AI features."
+        )
+
+    records = db_mysql.fetch_all() if inventory_items is None else inventory_items
+    prompt = (
+        "You are an inventory management assistant. Use only the supplied records for factual answers. "
+        "Each record has an inventory_date, material_type, and quantity. Do not invent records or quantities. "
+        "Explain calculations when relevant, and say if there are no records."
+    )
+
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        instructions=prompt,
+        input=(
+            f"Inventory records: {json.dumps(records, ensure_ascii=False)}\n\n"
+            f"User question: {question}"
+        )
+    )
+    return response.output_text
 
 
 # ============================================================
@@ -414,6 +454,28 @@ def api_export_file():
     try:
         path = export_inventory_to_json()
         return jsonify({"status": "success", "file_path": path}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/inventory/ai", methods=["POST"])
+@jwt_required()
+def api_ai_inventory_assistant():
+    try:
+        current_user = get_jwt_identity()
+        req_data = request.get_json() or {}
+        question = str(req_data.get("question", "")).strip()
+
+        if not question:
+            raise InvalidDataError("Question is required for AI assistance.")
+
+        answer = get_ai_inventory_answer(question)
+        db_mongo.log_event("AI_QUERY", {"question": question}, user=current_user)
+        return jsonify({"status": "success", "question": question, "answer": answer}), 200
+    except InventoryError as ie:
+        return jsonify({"status": "fail", "message": str(ie)}), 400
+    except RuntimeError as re:
+        return jsonify({"status": "error", "message": str(re)}), 500
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
